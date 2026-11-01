@@ -1,0 +1,14 @@
+menu "Robot v1 config"
+    config ROBOT_WIFI_SSID
+        string "WiFi SSID"
+        default "FILL_ME"
+    config ROBOT_WIFI_PASS
+        string "WiFi password"
+        default "FILL_ME"
+    config ROBOT_BACKEND_URL
+        string "Backend POST /voice URL"
+        default "http://123.56.65.132:8181/voice"
+    config ROBOT_DEVICE_TOKEN
+        string "X-Device-Token (must match backend ROBOT_DEVICE_TOKEN)"
+        default "FILL_ME"
+endmenu

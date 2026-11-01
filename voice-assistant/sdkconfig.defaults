@@ -1,0 +1,20 @@
+CONFIG_IDF_TARGET="esp32s3"
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_OCT=y
+CONFIG_SPIRAM_SPEED_80M=y
+CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=8
+CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=16
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+# Wake word (user 2026-10-31): built-in wn9_xiaojianxiaojian_tts2
+# ("小箭小箭"), replacing wn9_nihaoxiaoxin_tts ("你好小鑫") and
+# wn9_hilexin ("Hi,乐鑫"). The wake-word models are independent
+# booleans under "Load Multiple Wake Words", NOT a single choice:
+# check only this one in menuconfig -> ESP Speech Recognition, or
+# every checked word will wake the board. Menuconfig is
+# authoritative over this file for a local sdkconfig that already
+# has a value; an unknown line here is only a warning.
+CONFIG_SR_WN_WN9_XIAOJIANXIAOJIAN_TTS2=y
+# The main task runs the AFE fetch loop: headroom over the default.
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192

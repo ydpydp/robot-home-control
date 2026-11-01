@@ -1,0 +1,8 @@
+# Robot v1 partition table (16 MB flash, N16R8)
+# App stays at 0x10000 (same offset as before); factory enlarged to 2 MB
+# so the waiting-prompt phrase arrays fit inside the app image.
+# Name,   Type, SubType, Offset,  Size, Flags
+nvs,      data, nvs,     0x9000,  0x6000,
+phy_init, data, phy,     0xf000,  0x1000,
+factory,  app,  factory, 0x10000, 0x200000,
+model,    data, ,        0x210000, 0x200000,

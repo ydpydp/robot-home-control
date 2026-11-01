@@ -1,0 +1,16 @@
+[Unit]
+Description=Conversational robot backend gateway (board -> Qwen -> Piper)
+After=network-online.target tts.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/robot
+ExecStart=/usr/bin/python3 /opt/robot/robot_backend.py
+EnvironmentFile=/etc/robot-backend.env
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
