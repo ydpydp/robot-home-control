@@ -277,13 +277,24 @@ void app_main(void)
     gpio_set_level(ACTUATOR_PWR_GPIO, 1);
     rhc_state_on = 0;
 
-    /* Watchdog: 10 s, fed by the main loop below. */
+    /* Watchdog, fed by the main loop below. IDF already initializes the
+     * task watchdog at startup when CONFIG_ESP_TASK_WDT_EN is on (the
+     * default), so a second init returns ESP_ERR_INVALID_STATE ("TWDT
+     * already initialized") -- that must NOT abort. Tolerate it and just
+     * subscribe this task; the effective timeout is then the system
+     * default (5 s), which the 1 s feed loop satisfies comfortably.
+     * (A second init + ESP_ERROR_CHECK caused the 2026-11-02 boot abort
+     * loop on hardware; a VM build cannot catch it, it only fires at
+     * runtime.) */
     esp_task_wdt_config_t wdt_cfg = {
         .timeout_ms = 10000,
         .idle_core_mask = 0,
         .trigger_panic = true,
     };
-    ESP_ERROR_CHECK(esp_task_wdt_init(&wdt_cfg));
+    esp_err_t wdt_ret = esp_task_wdt_init(&wdt_cfg);
+    if (wdt_ret != ESP_OK && wdt_ret != ESP_ERR_INVALID_STATE) {
+        ESP_ERROR_CHECK(wdt_ret);
+    }
     ESP_ERROR_CHECK(esp_task_wdt_add(NULL));
 
     ble_hs_cfg.sync_cb = rhc_on_sync;
