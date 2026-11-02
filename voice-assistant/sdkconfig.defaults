@@ -18,3 +18,11 @@ CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
 CONFIG_SR_WN_WN9_XIAOJIANXIAOJIAN_TTS2=y
 # The main task runs the AFE fetch loop: headroom over the default.
 CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
+
+# BLE central (voice-assistant controls the actuator, plan §2):
+# NimBLE host + controller, bonds persisted in NVS so re-pairing
+# is not needed after reboot.
+CONFIG_BT_ENABLED=y
+CONFIG_BT_CONTROLLER_ENABLED=y
+CONFIG_BT_NIMBLE_ENABLED=y
+CONFIG_BT_NIMBLE_NVS_PERSIST=y

@@ -54,6 +54,7 @@
 #include "driver/rmt_encoder.h"
 #include "esp_http_client.h"
 #include "esp_heap_caps.h"
+#include "ble_central.h"
 
 static const char *TAG = "robot_v1";
 
@@ -469,6 +470,12 @@ static char g_audio_format[24];
 static bool g_seg_mode;
 static int g_seg_total = 1;
 static char g_session[40];
+/* Control reply (plan §2): X-Command carries "device:action[:param]"
+   (e.g. "livingroom_light:on"); X-Failure-Text carries the spoken
+   failure line for /speak. Both reset per round in
+   upload_and_download. */
+static char g_command[128];
+static char g_failure_text[256];
 /* Download target for http_event: set before each request so the
    prefetch task can download into a different buffer than the one
    being played. */
@@ -486,6 +493,11 @@ static esp_err_t http_event(esp_http_client_event_t *e)
             if (g_seg_total < 1) g_seg_total = 1;
         } else if (strcasecmp(e->header_key, "X-Session-Id") == 0) {
             snprintf(g_session, sizeof(g_session), "%s", e->header_value);
+        } else if (strcasecmp(e->header_key, "X-Command") == 0) {
+            snprintf(g_command, sizeof(g_command), "%s", e->header_value);
+        } else if (strcasecmp(e->header_key, "X-Failure-Text") == 0) {
+            snprintf(g_failure_text, sizeof(g_failure_text), "%s",
+                     e->header_value);
         }
     }
     if (e->event_id == HTTP_EVENT_ON_DATA && g_dl_buf &&
@@ -542,6 +554,8 @@ static bool upload_and_download(const int16_t *pcm, size_t nbytes)
     g_seg_total = 1;
     g_session[0] = '\0';
     g_audio_format[0] = '\0';
+    g_command[0] = '\0';
+    g_failure_text[0] = '\0';
     g_dl_buf = play_buf;
     g_dl_cap = PLAY_BUF_BYTES;
     esp_http_client_config_t cfg = {
@@ -841,6 +855,62 @@ static void play_audio(void)
     ESP_ERROR_CHECK(i2s_channel_disable(spk_chan));
 }
 
+/* Failure line via POST /speak (backend endpoint, plan §4): the
+   request body is {"text": "..."} and the reply is one raw
+   s16le-16k-mono utterance, played as a single segment. Returns
+   false if /speak is missing or fails -- then the caller takes
+   the red 1 s -> green path. */
+static bool play_failure_text(void)
+{
+    if (g_failure_text[0] == '\0') return false;
+    /* Escape backslash and quote for the JSON string. The text
+       comes from our own backend header, but a quote in it must
+       never break the request. */
+    char esc[300];
+    size_t ei = 0;
+    for (const char *p = g_failure_text; *p && ei + 2 < sizeof(esc); p++) {
+        if (*p == '"' || *p == '\\') esc[ei++] = '\\';
+        esc[ei++] = *p;
+    }
+    esc[ei] = '\0';
+    char body[340];
+    int blen = snprintf(body, sizeof(body), "{\"text\":\"%s\"}", esc);
+    if (blen <= 0 || blen >= (int)sizeof(body)) return false;
+    /* Derive the /speak URL from the /voice URL. */
+    char url[256];
+    const char *base = CONFIG_ROBOT_BACKEND_URL;
+    size_t blen_url = strlen(base);
+    if (blen_url > 6 && strcmp(base + blen_url - 6, "/voice") == 0) blen_url -= 6;
+    if (blen_url >= sizeof(url) - 16) return false;
+    memcpy(url, base, blen_url);
+    url[blen_url] = '\0';
+    strcat(url, "/speak");
+    g_dl_buf = play_buf;
+    g_dl_cap = PLAY_BUF_BYTES;
+    g_play_len = 0;
+    esp_http_client_config_t cfg = {
+        .url = url,
+        .method = HTTP_METHOD_POST,
+        .event_handler = http_event,
+        .timeout_ms = SEG_HTTP_TIMEOUT_MS,
+    };
+    esp_http_client_handle_t client = esp_http_client_init(&cfg);
+    esp_http_client_set_header(client, "Content-Type", "application/json");
+    esp_http_client_set_header(client, "X-Device-Token", CONFIG_ROBOT_DEVICE_TOKEN);
+    esp_http_client_set_post_field(client, body, blen);
+    esp_err_t err = esp_http_client_perform(client);
+    long status = esp_http_client_get_status_code(client);
+    esp_http_client_cleanup(client);
+    if (err != ESP_OK || status != 200 || g_play_len == 0 || g_play_len % 2 != 0) {
+        ESP_LOGE(TAG, "speak failed err=%d status=%ld play_len=%zu",
+                 err, status, g_play_len);
+        return false;
+    }
+    ESP_LOGI(TAG, "failure line %zu bytes, playing", g_play_len);
+    play_segment_audio_buf(play_buf, g_play_len);
+    return true;
+}
+
 void app_main(void)
 {
     ESP_ERROR_CHECK(nvs_flash_init());
@@ -851,6 +921,9 @@ void app_main(void)
     i2s_init();
     play_startup_tone();
     wifi_init();
+    /* BLE central: scan/connect in the background from here on, so
+       the first voice round can already use a live connection. */
+    ble_central_init();
     rec_buf = heap_caps_malloc(REC_BUF_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     play_buf = heap_caps_malloc(PLAY_BUF_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!rec_buf || !play_buf) {
@@ -912,7 +985,24 @@ void app_main(void)
                    the yellow phase stays silent until the reply
                    itself plays. */
                 bool ok = upload_and_download(rec_buf, n);
-                if (ok) {
+                if (ok && g_command[0] != '\0') {
+                    /* Control reply (plan §2): BLE-execute first and
+                       wait for the actuator's state-notify receipt
+                       (2 s) BEFORE playing the spoken confirmation.
+                       On failure the normal reply is dropped --
+                       never confirm an action that did not happen --
+                       and the failure line is spoken via /speak
+                       instead; if /speak is missing, the red 1 s ->
+                       green path below runs. */
+                    if (ble_central_execute(g_command)) {
+                        led_set(255, 0, 255); /* playing */
+                        if (g_seg_mode) ok = play_segment_loop();
+                        else play_audio();
+                    } else {
+                        led_set(255, 0, 255); /* playing */
+                        ok = play_failure_text();
+                    }
+                } else if (ok) {
                     led_set(255, 0, 255); /* playing */
                     if (g_seg_mode) ok = play_segment_loop();
                     else play_audio();
