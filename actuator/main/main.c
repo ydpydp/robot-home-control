@@ -1,9 +1,12 @@
 /* RHC actuator (N8R8) bench skeleton: BLE peripheral + LED as relay stand-in.
  *
- * Board: ESP32-S3 N8R8. The LED stands in for the relay: lit = closed (ON),
- * dark = open (OFF). Boot state is OFF (relay-safe).
- * LED pin: GPIO2 (NOT GPIO19: GPIO19 is native USB D-, and N8R8 flashes
- * over native USB, so a load there can break enumeration).
+ * Board: ESP32-S3 N8R8. The bench LED stands in for the relay; the relay
+ * control is active-low (see below). Boot state is OFF (relay-safe).
+ * Relay control pin: GPIO12, ACTIVE-LOW: LOW = ON (closed), HIGH = OFF (open).
+ * Boot default is HIGH (OFF, relay-safe). GPIO48 is driven HIGH at boot
+ * as a power indicator.
+ * GPIO19 is NOT used: it is native USB D-, and N8R8 flashes over native USB,
+ * so a load there can break enumeration.
  * Avoided pins: strapping 0/3/45/46, USB 19/20, WS2812 47, UART0 43/44.
  * Commands are plain text and idempotent; unknown commands are ignored.
  */
@@ -26,8 +29,10 @@
 
 static const char *TAG = "RHC_ACT";
 
-/* One-line change if the LED moves. */
-#define ACTUATOR_LED_GPIO 2
+/* Relay control pin (bench LED wired here). Active-low: LOW = ON, HIGH = OFF. */
+#define ACTUATOR_CTRL_GPIO 12
+/* Power indicator: driven HIGH at boot. */
+#define ACTUATOR_PWR_GPIO 48
 
 /* BLE identifiers (also in docs/语音控家电v1计划.md §3.2). */
 #define RHC_DEVICE_NAME "RHC-Actuator"
@@ -54,7 +59,7 @@ static int rhc_state_on = 0; /* 0 = OFF (LED dark), 1 = ON (LED lit) */
 static void rhc_apply_state(int on)
 {
     rhc_state_on = on ? 1 : 0;
-    gpio_set_level(ACTUATOR_LED_GPIO, rhc_state_on);
+    gpio_set_level(ACTUATOR_CTRL_GPIO, rhc_state_on ? 0 : 1);
     ESP_LOGI(TAG, "state -> %s", rhc_state_on ? "ON" : "OFF");
 }
 
@@ -94,7 +99,7 @@ static void rhc_handle_command(const uint8_t *data, uint16_t len)
     } else if (strcmp(buf, "OFF") == 0) {
         rhc_apply_state(0);
     } else if (strncmp(buf, "BRI:", 4) == 0) {
-        /* LED has no brightness: any level > 0 lights it. */
+        /* No brightness on a relay: any level > 0 means ON (pin low). */
         rhc_apply_state(atoi(buf + 4) > 0);
     } else {
         ESP_LOGW(TAG, "unknown command, ignored");
@@ -262,10 +267,14 @@ void app_main(void)
     }
     ESP_ERROR_CHECK(ret);
 
-    /* LED (relay stand-in), boot OFF. */
-    gpio_reset_pin(ACTUATOR_LED_GPIO);
-    gpio_set_direction(ACTUATOR_LED_GPIO, GPIO_MODE_OUTPUT);
-    gpio_set_level(ACTUATOR_LED_GPIO, 0);
+    /* Relay control (bench LED wired here): boot HIGH = OFF (relay-safe).
+     * Power indicator: boot HIGH. */
+    gpio_reset_pin(ACTUATOR_CTRL_GPIO);
+    gpio_set_direction(ACTUATOR_CTRL_GPIO, GPIO_MODE_OUTPUT);
+    gpio_set_level(ACTUATOR_CTRL_GPIO, 1);
+    gpio_reset_pin(ACTUATOR_PWR_GPIO);
+    gpio_set_direction(ACTUATOR_PWR_GPIO, GPIO_MODE_OUTPUT);
+    gpio_set_level(ACTUATOR_PWR_GPIO, 1);
     rhc_state_on = 0;
 
     /* Watchdog: 10 s, fed by the main loop below. */
