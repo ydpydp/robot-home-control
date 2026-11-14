@@ -45,6 +45,17 @@ static const char *TAG = "RHC_ACT";
 /* Relay control pin (bench LED wired here). Active-low: LOW = ON, HIGH = OFF. */
 #define ACTUATOR_CTRL_GPIO 10
 
+/* Bench-test indicator: the Super Mini's onboard blue LED is on
+ * GPIO8, wired 3.3V -> 1K -> LED -> GPIO8, so it lights when the
+ * pin is LOW -- the same active-low sense as the relay. Mirroring
+ * the relay level here lets the bench test run with no external
+ * LED or relay wired, and the LED keeps showing the relay state
+ * after the physical relay is connected. GPIO8 is a strapping pin
+ * (flash-voltage select), but the LED circuit holds it HIGH at
+ * reset, so boot is unaffected; it is only driven as an output
+ * after boot. */
+#define ACTUATOR_LED_GPIO 8
+
 /* BLE identifiers (also in docs/语音控家电v1计划.md §3.2).
  * The broadcast name is set at build time (-DRHC_DEVICE_NAME=...);
  * default is the living-room lamp. */
@@ -75,6 +86,7 @@ static void rhc_apply_state(int on)
 {
     rhc_state_on = on ? 1 : 0;
     gpio_set_level(ACTUATOR_CTRL_GPIO, rhc_state_on ? 0 : 1);
+    gpio_set_level(ACTUATOR_LED_GPIO, rhc_state_on ? 0 : 1);
     ESP_LOGI(TAG, "state -> %s", rhc_state_on ? "ON" : "OFF");
 }
 
@@ -295,10 +307,14 @@ void app_main(void)
     }
     ESP_ERROR_CHECK(ret);
 
-    /* Relay control (bench LED wired here): boot HIGH = OFF (relay-safe). */
+    /* Relay control (bench LED wired here): boot HIGH = OFF (relay-safe).
+     * Onboard blue LED mirrors the relay: boot HIGH = LED off. */
     gpio_reset_pin(ACTUATOR_CTRL_GPIO);
     gpio_set_direction(ACTUATOR_CTRL_GPIO, GPIO_MODE_OUTPUT);
     gpio_set_level(ACTUATOR_CTRL_GPIO, 1);
+    gpio_reset_pin(ACTUATOR_LED_GPIO);
+    gpio_set_direction(ACTUATOR_LED_GPIO, GPIO_MODE_OUTPUT);
+    gpio_set_level(ACTUATOR_LED_GPIO, 1);
     rhc_state_on = 0;
 
     /* Watchdog, fed by the main loop below. IDF already initializes the
