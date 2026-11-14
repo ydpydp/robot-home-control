@@ -127,7 +127,10 @@ static void rhc_start_scan(void)
 {
     if (rhc_scanning || rhc_all_connected()) return;
     /* Active scan: the actuator's name lives in the scan response,
-       which passive scanning never receives. */
+       which passive scanning never receives. Duration is
+       BLE_HS_FOREVER: a 0 here does NOT mean "forever", NimBLE
+       replaces it with the 10.24 s default and the scan then stops
+       on its own -- a device powered on later would never be seen. */
     static const struct ble_gap_disc_params params = {
         .itvl = 0x0080, .window = 0x0040,
         .filter_policy = 0, .limited = 0, .passive = 0,
@@ -138,7 +141,8 @@ static void rhc_start_scan(void)
         ESP_LOGE(TAG, "no own address type, scan deferred");
         return;
     }
-    int rc = ble_gap_disc(own_addr_type, 0, &params, rhc_gap_event, NULL);
+    int rc = ble_gap_disc(own_addr_type, BLE_HS_FOREVER, &params,
+                          rhc_gap_event, NULL);
     if (rc == 0 || rc == BLE_HS_EALREADY) {
         rhc_scanning = true;
         rhc_uuid_seen_count = 0;
@@ -315,8 +319,15 @@ static int rhc_gap_event(struct ble_gap_event *event, void *arg)
                 dev->connecting) {
                 return 0;
             }
-            /* Wanted actuator found: connect (scan stops, and is
-               resumed for the other actuator once connected). */
+            /* Wanted actuator found: cancel the scan first, then
+               connect. ble_gap_connect() returns BLE_HS_EBUSY (15)
+               while a scan is active (the ESP-IDF default has
+               BLE_HOST_ALLOW_CONNECT_WITH_SCAN off), so a connect
+               attempted with the scan still running is rejected
+               every time -- the scan must be cancelled explicitly,
+               as the old single-device central did. The scan is
+               resumed for the other actuator once connected. */
+            ble_gap_disc_cancel();
             dev->connecting = true;
             rhc_scanning = false;
             static const struct ble_gap_conn_params conn_params = {
