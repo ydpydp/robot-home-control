@@ -1,5 +1,20 @@
 /* BLE central for the voice assistant -- see ble_central.h.
  *
+ * Multi-device (2026-11-14): two actuators, RHC-Livingroom
+ * (livingroom_light) and RHC-Bedroom (bedroom_light). The central
+ * keeps one connection per actuator, picks them by broadcast name,
+ * and routes each X-Command to the connection whose device id
+ * matches. Connections are held simultaneously; each actuator
+ * re-connects on its own after a drop.
+ *
+ * Name matching needs the scan response: a legacy advertising
+ * packet is 31 bytes, and flags (3) + the 128-bit service UUID
+ * (18) leave no room for the full 14-byte name, so the actuator
+ * puts its name in the scan response and the central scans
+ * actively (passive = 0). A scan response is only trusted when
+ * the same address already advertised the RHC service UUID in
+ * this scan session (small address table below).
+ *
  * Structure follows the ESP-IDF NimBLE blecent example: one host
  * task running nimble_port_run(), all state changes driven by GAP
  * events, GATT discovery chained service -> characteristics ->
@@ -29,29 +44,93 @@ static const char *TAG = "rhc_ble";
 #define RHC_CMD_UUID_STR   "8e2e563b-410a-4ce4-8a16-c1a43b3d5f13"
 #define RHC_STATE_UUID_STR "fe07c9e6-ece5-4cc7-8467-531233dc6565"
 
-#define RHC_READY_BIT   BIT0
-#define RHC_RECEIPT_BIT BIT1
+#define RHC_RECEIPT_BIT BIT0
 #define RHC_RECEIPT_TIMEOUT_MS 2000 /* plan §3.2: receipt within 2 s */
+
+#define RHC_MAX_DEVICES 2
+#define RHC_SEEN_MAX 4 /* addresses advertising the UUID, per scan */
+
+typedef struct {
+    const char *adv_name; /* broadcast name, e.g. "RHC-Livingroom" */
+    const char *device_id; /* X-Command device, e.g. "livingroom_light" */
+    uint16_t conn_handle;
+    uint16_t cmd_handle;
+    uint16_t state_handle;
+    uint16_t cccd_handle;
+    uint16_t svc_start_handle;
+    uint16_t svc_end_handle;
+    bool ready;
+    bool connecting;
+    char receipt[16]; /* last state-notify payload ("ON"/"OFF") */
+} rhc_device_t;
+
+static rhc_device_t rhc_devices[RHC_MAX_DEVICES] = {
+    { .adv_name = "RHC-Livingroom", .device_id = "livingroom_light",
+      .conn_handle = BLE_HS_CONN_HANDLE_NONE },
+    { .adv_name = "RHC-Bedroom", .device_id = "bedroom_light",
+      .conn_handle = BLE_HS_CONN_HANDLE_NONE },
+};
 
 static EventGroupHandle_t rhc_events;
 static SemaphoreHandle_t rhc_exec_mutex;
-static uint16_t rhc_conn_handle = BLE_HS_CONN_HANDLE_NONE;
-static uint16_t rhc_cmd_handle;
-static uint16_t rhc_state_handle;
-static uint16_t rhc_svc_start_handle;
-static uint16_t rhc_svc_end_handle;
-static uint16_t rhc_cccd_handle;
 static bool rhc_scanning;
-static char rhc_receipt[16]; /* last state-notify payload ("ON"/"OFF") */
+/* Addresses that advertised the RHC service UUID in this scan
+   session, so a scan response from the same address can be
+   trusted as the same device. */
+static ble_addr_t rhc_uuid_seen[RHC_SEEN_MAX];
+static int rhc_uuid_seen_count;
 
 static int rhc_gap_event(struct ble_gap_event *event, void *arg);
 
+static rhc_device_t *rhc_find_by_conn(uint16_t conn_handle)
+{
+    for (int i = 0; i < RHC_MAX_DEVICES; i++) {
+        if (rhc_devices[i].conn_handle == conn_handle) {
+            return &rhc_devices[i];
+        }
+    }
+    return NULL;
+}
+
+static rhc_device_t *rhc_find_by_device_id(const char *device_id)
+{
+    for (int i = 0; i < RHC_MAX_DEVICES; i++) {
+        if (strcmp(rhc_devices[i].device_id, device_id) == 0) {
+            return &rhc_devices[i];
+        }
+    }
+    return NULL;
+}
+
+static rhc_device_t *rhc_find_by_adv_name(const char *name, size_t len)
+{
+    for (int i = 0; i < RHC_MAX_DEVICES; i++) {
+        if (strlen(rhc_devices[i].adv_name) == len &&
+            memcmp(rhc_devices[i].adv_name, name, len) == 0) {
+            return &rhc_devices[i];
+        }
+    }
+    return NULL;
+}
+
+static bool rhc_all_connected(void)
+{
+    for (int i = 0; i < RHC_MAX_DEVICES; i++) {
+        if (rhc_devices[i].conn_handle == BLE_HS_CONN_HANDLE_NONE) {
+            return false;
+        }
+    }
+    return true;
+}
+
 static void rhc_start_scan(void)
 {
-    if (rhc_scanning) return;
+    if (rhc_scanning || rhc_all_connected()) return;
+    /* Active scan: the actuator's name lives in the scan response,
+       which passive scanning never receives. */
     static const struct ble_gap_disc_params params = {
         .itvl = 0x0080, .window = 0x0040,
-        .filter_policy = 0, .limited = 0, .passive = 1,
+        .filter_policy = 0, .limited = 0, .passive = 0,
         .filter_duplicates = 1,
     };
     uint8_t own_addr_type;
@@ -62,6 +141,7 @@ static void rhc_start_scan(void)
     int rc = ble_gap_disc(own_addr_type, 0, &params, rhc_gap_event, NULL);
     if (rc == 0 || rc == BLE_HS_EALREADY) {
         rhc_scanning = true;
+        rhc_uuid_seen_count = 0;
     } else {
         ESP_LOGE(TAG, "scan start failed rc=%d", rc);
     }
@@ -74,7 +154,7 @@ static void rhc_on_reset(int reason)
 
 static void rhc_on_sync(void)
 {
-    ESP_LOGI(TAG, "NimBLE host synced, scanning for actuator");
+    ESP_LOGI(TAG, "NimBLE host synced, scanning for actuators");
     rhc_start_scan();
 }
 
@@ -85,20 +165,21 @@ static void rhc_host_task(void *param)
     nimble_port_freertos_deinit();
 }
 
-/* --- GATT discovery chain --- */
+/* --- GATT discovery chain (per device; device passed as arg) --- */
 
 static int rhc_subscribe_cb(uint16_t conn_handle,
                             const struct ble_gatt_error *error,
                             struct ble_gatt_attr *attr, void *arg)
 {
     (void)attr;
-    (void)arg;
+    rhc_device_t *dev = arg;
     if (error->status == 0) {
-        ESP_LOGI(TAG, "subscribed to state notify, actuator ready");
-        xEventGroupSetBits(rhc_events, RHC_READY_BIT);
+        dev->ready = true;
+        ESP_LOGI(TAG, "subscribed to state notify, %s ready",
+                 dev->adv_name);
     } else {
-        ESP_LOGE(TAG, "subscribe failed status=%d, disconnecting",
-                 error->status);
+        ESP_LOGE(TAG, "subscribe failed status=%d, disconnecting %s",
+                 error->status, dev->adv_name);
         ble_gap_terminate(conn_handle, BLE_ERR_REM_USER_CONN_TERM);
     }
     return 0;
@@ -109,27 +190,28 @@ static int rhc_dsc_disc_cb(uint16_t conn_handle,
                            uint16_t chr_val_handle,
                            const struct ble_gatt_dsc *dsc, void *arg)
 {
-    (void)arg;
     (void)chr_val_handle;
+    rhc_device_t *dev = arg;
     if (error->status == 0 && dsc != NULL) {
         ble_uuid16_t cccd = BLE_UUID16_INIT(0x2902);
         if (ble_uuid_cmp(&dsc->uuid.u, &cccd.u) == 0) {
-            rhc_cccd_handle = dsc->handle;
+            dev->cccd_handle = dsc->handle;
         }
         return 0;
     }
-    if (error->status != BLE_HS_EDONE || rhc_cccd_handle == 0) {
-        ESP_LOGE(TAG, "CCCD not found, status=%d, disconnecting",
-                 error->status);
+    if (error->status != BLE_HS_EDONE || dev->cccd_handle == 0) {
+        ESP_LOGE(TAG, "CCCD not found, status=%d, disconnecting %s",
+                 error->status, dev->adv_name);
         ble_gap_terminate(conn_handle, BLE_ERR_REM_USER_CONN_TERM);
         return 0;
     }
     /* Subscribe: write 0x0001 (notifications) to the CCCD. */
     uint8_t val[2] = {0x01, 0x00};
-    int rc = ble_gattc_write_flat(conn_handle, rhc_cccd_handle, val,
-                                  sizeof(val), rhc_subscribe_cb, NULL);
+    int rc = ble_gattc_write_flat(conn_handle, dev->cccd_handle, val,
+                                  sizeof(val), rhc_subscribe_cb, dev);
     if (rc != 0) {
-        ESP_LOGE(TAG, "CCCD write failed rc=%d, disconnecting", rc);
+        ESP_LOGE(TAG, "CCCD write failed rc=%d, disconnecting %s",
+                 rc, dev->adv_name);
         ble_gap_terminate(conn_handle, BLE_ERR_REM_USER_CONN_TERM);
     }
     return 0;
@@ -139,32 +221,32 @@ static int rhc_chr_disc_cb(uint16_t conn_handle,
                            const struct ble_gatt_error *error,
                            const struct ble_gatt_chr *chr, void *arg)
 {
-    (void)arg;
+    rhc_device_t *dev = arg;
     if (error->status == 0 && chr != NULL) {
         ble_uuid_any_t cmd_uuid, state_uuid;
         ble_uuid_from_str(&cmd_uuid, RHC_CMD_UUID_STR);
         ble_uuid_from_str(&state_uuid, RHC_STATE_UUID_STR);
         if (ble_uuid_cmp(&chr->uuid.u, &cmd_uuid.u) == 0) {
-            rhc_cmd_handle = chr->val_handle;
+            dev->cmd_handle = chr->val_handle;
         } else if (ble_uuid_cmp(&chr->uuid.u, &state_uuid.u) == 0) {
-            rhc_state_handle = chr->val_handle;
+            dev->state_handle = chr->val_handle;
         }
         return 0;
     }
-    if (error->status != BLE_HS_EDONE || rhc_cmd_handle == 0 ||
-        rhc_state_handle == 0) {
+    if (error->status != BLE_HS_EDONE || dev->cmd_handle == 0 ||
+        dev->state_handle == 0) {
         ESP_LOGE(TAG, "command/state chars not found, status=%d cmd=%u "
-                 "state=%u, disconnecting", error->status,
-                 rhc_cmd_handle, rhc_state_handle);
+                 "state=%u, disconnecting %s", error->status,
+                 dev->cmd_handle, dev->state_handle, dev->adv_name);
         ble_gap_terminate(conn_handle, BLE_ERR_REM_USER_CONN_TERM);
         return 0;
     }
-    int rc = ble_gattc_disc_all_dscs(conn_handle, rhc_state_handle,
-                                     rhc_svc_end_handle, rhc_dsc_disc_cb,
-                                     NULL);
+    int rc = ble_gattc_disc_all_dscs(conn_handle, dev->state_handle,
+                                     dev->svc_end_handle, rhc_dsc_disc_cb,
+                                     dev);
     if (rc != 0) {
-        ESP_LOGE(TAG, "descriptor discovery failed rc=%d, disconnecting",
-                 rc);
+        ESP_LOGE(TAG, "descriptor discovery failed rc=%d, disconnecting %s",
+                 rc, dev->adv_name);
         ble_gap_terminate(conn_handle, BLE_ERR_REM_USER_CONN_TERM);
     }
     return 0;
@@ -174,24 +256,24 @@ static int rhc_svc_disc_cb(uint16_t conn_handle,
                            const struct ble_gatt_error *error,
                            const struct ble_gatt_svc *svc, void *arg)
 {
-    (void)arg;
+    rhc_device_t *dev = arg;
     if (error->status == 0 && svc != NULL) {
-        rhc_svc_start_handle = svc->start_handle;
-        rhc_svc_end_handle = svc->end_handle;
+        dev->svc_start_handle = svc->start_handle;
+        dev->svc_end_handle = svc->end_handle;
         return 0;
     }
-    if (error->status != BLE_HS_EDONE || rhc_svc_end_handle == 0) {
-        ESP_LOGE(TAG, "RHC service not found, status=%d, disconnecting",
-                 error->status);
+    if (error->status != BLE_HS_EDONE || dev->svc_end_handle == 0) {
+        ESP_LOGE(TAG, "RHC service not found, status=%d, disconnecting %s",
+                 error->status, dev->adv_name);
         ble_gap_terminate(conn_handle, BLE_ERR_REM_USER_CONN_TERM);
         return 0;
     }
-    int rc = ble_gattc_disc_all_chrs(conn_handle, rhc_svc_start_handle,
-                                     rhc_svc_end_handle, rhc_chr_disc_cb,
-                                     NULL);
+    int rc = ble_gattc_disc_all_chrs(conn_handle, dev->svc_start_handle,
+                                     dev->svc_end_handle, rhc_chr_disc_cb,
+                                     dev);
     if (rc != 0) {
         ESP_LOGE(TAG, "characteristic discovery failed rc=%d, "
-                 "disconnecting", rc);
+                 "disconnecting %s", rc, dev->adv_name);
         ble_gap_terminate(conn_handle, BLE_ERR_REM_USER_CONN_TERM);
     }
     return 0;
@@ -201,7 +283,6 @@ static int rhc_svc_disc_cb(uint16_t conn_handle,
 
 static int rhc_gap_event(struct ble_gap_event *event, void *arg)
 {
-    (void)arg;
     switch (event->type) {
     case BLE_GAP_EVENT_DISC: {
         struct ble_hs_adv_fields fields;
@@ -209,6 +290,61 @@ static int rhc_gap_event(struct ble_gap_event *event, void *arg)
                                     event->disc.length_data) != 0) {
             return 0;
         }
+        if (event->disc.event_type == BLE_HCI_ADV_RPT_EVTYPE_SCAN_RSP) {
+            /* The name lives in the scan response. Trust it only
+               if this address already advertised the RHC service
+               UUID in this scan session. */
+            rhc_device_t *dev = NULL;
+            if (fields.name != NULL) {
+                dev = rhc_find_by_adv_name((const char *)fields.name,
+                                           fields.name_len);
+            }
+            bool uuid_seen = false;
+            if (dev != NULL) {
+                for (int i = 0; i < rhc_uuid_seen_count; i++) {
+                    if (ble_addr_cmp(&rhc_uuid_seen[i],
+                                     &event->disc.addr) == 0) {
+                        uuid_seen = true;
+                        break;
+                    }
+                }
+            }
+            ble_hs_adv_parse_free();
+            if (dev == NULL || !uuid_seen ||
+                dev->conn_handle != BLE_HS_CONN_HANDLE_NONE ||
+                dev->connecting) {
+                return 0;
+            }
+            /* Wanted actuator found: connect (scan stops, and is
+               resumed for the other actuator once connected). */
+            dev->connecting = true;
+            rhc_scanning = false;
+            static const struct ble_gap_conn_params conn_params = {
+                .scan_itvl = 0x0010, .scan_window = 0x0010,
+                .itvl_min = BLE_GAP_INITIAL_CONN_ITVL_MIN,
+                .itvl_max = BLE_GAP_INITIAL_CONN_ITVL_MAX,
+                .latency = 0, .supervision_timeout = 0x0100,
+                .min_ce_len = 0x0010, .max_ce_len = 0x0300,
+            };
+            uint8_t own_addr_type;
+            if (ble_hs_id_infer_auto(0, &own_addr_type) != 0) {
+                dev->connecting = false;
+                rhc_start_scan();
+                return 0;
+            }
+            int rc = ble_gap_connect(own_addr_type, &event->disc.addr,
+                                     30000, &conn_params, rhc_gap_event,
+                                     dev);
+            if (rc != 0) {
+                ESP_LOGW(TAG, "connect failed rc=%d, rescan %s",
+                         rc, dev->adv_name);
+                dev->connecting = false;
+                rhc_start_scan();
+            }
+            return 0;
+        }
+        /* Advertising packet: record addresses carrying the RHC
+           service UUID so their scan response can be trusted. */
         ble_uuid_any_t svc_uuid;
         bool found = false;
         if (ble_uuid_from_str(&svc_uuid, RHC_SVC_UUID_STR) == 0) {
@@ -223,77 +359,83 @@ static int rhc_gap_event(struct ble_gap_event *event, void *arg)
         if (!found) {
             return 0;
         }
-        /* Actuator found: stop scanning, connect. */
-        ble_gap_disc_cancel();
-        rhc_scanning = false;
-        static const struct ble_gap_conn_params conn_params = {
-            .scan_itvl = 0x0010, .scan_window = 0x0010,
-            .itvl_min = BLE_GAP_INITIAL_CONN_ITVL_MIN,
-            .itvl_max = BLE_GAP_INITIAL_CONN_ITVL_MAX,
-            .latency = 0, .supervision_timeout = 0x0100,
-            .min_ce_len = 0x0010, .max_ce_len = 0x0300,
-        };
-        uint8_t own_addr_type;
-        if (ble_hs_id_infer_auto(0, &own_addr_type) != 0) {
-            rhc_start_scan();
-            return 0;
+        for (int i = 0; i < rhc_uuid_seen_count; i++) {
+            if (ble_addr_cmp(&rhc_uuid_seen[i], &event->disc.addr) == 0) {
+                return 0;
+            }
         }
-        int rc = ble_gap_connect(own_addr_type, &event->disc.addr,
-                                 30000, &conn_params, rhc_gap_event,
-                                 NULL);
-        if (rc != 0) {
-            ESP_LOGW(TAG, "connect failed rc=%d, rescan", rc);
-            rhc_start_scan();
+        if (rhc_uuid_seen_count < RHC_SEEN_MAX) {
+            rhc_uuid_seen[rhc_uuid_seen_count++] = event->disc.addr;
         }
         return 0;
     }
-    case BLE_GAP_EVENT_CONNECT:
+    case BLE_GAP_EVENT_CONNECT: {
+        rhc_device_t *dev = arg;
         if (event->connect.status == 0) {
-            rhc_conn_handle = event->connect.conn_handle;
-            rhc_cmd_handle = rhc_state_handle = rhc_cccd_handle = 0;
-            rhc_svc_start_handle = rhc_svc_end_handle = 0;
-            ESP_LOGI(TAG, "connected, handle %u, securing + discovering",
-                     rhc_conn_handle);
+            dev->conn_handle = event->connect.conn_handle;
+            dev->connecting = false;
+            dev->cmd_handle = dev->state_handle = dev->cccd_handle = 0;
+            dev->svc_start_handle = dev->svc_end_handle = 0;
+            dev->ready = false;
+            ESP_LOGI(TAG, "connected %s, handle %u, securing + discovering",
+                     dev->adv_name, dev->conn_handle);
             /* Bond (LE SC, Just Works). On a bonded peer this
                restores encryption silently. */
-            ble_gap_security_initiate(rhc_conn_handle);
+            ble_gap_security_initiate(dev->conn_handle);
             ble_uuid_any_t svc_uuid;
             ble_uuid_from_str(&svc_uuid, RHC_SVC_UUID_STR);
-            int rc = ble_gattc_disc_svc_by_uuid(rhc_conn_handle,
+            int rc = ble_gattc_disc_svc_by_uuid(dev->conn_handle,
                                                 &svc_uuid.u,
-                                                rhc_svc_disc_cb, NULL);
+                                                rhc_svc_disc_cb, dev);
             if (rc != 0) {
                 ESP_LOGE(TAG, "service discovery failed rc=%d, "
-                         "disconnecting", rc);
-                ble_gap_terminate(rhc_conn_handle,
+                         "disconnecting %s", rc, dev->adv_name);
+                ble_gap_terminate(dev->conn_handle,
                                   BLE_ERR_REM_USER_CONN_TERM);
             }
         } else {
-            ESP_LOGW(TAG, "connect failed status=%d, rescan",
-                     event->connect.status);
+            ESP_LOGW(TAG, "connect failed status=%d, rescan %s",
+                     event->connect.status, dev->adv_name);
+            dev->connecting = false;
             rhc_start_scan();
+            return 0;
         }
-        return 0;
-    case BLE_GAP_EVENT_DISCONNECT:
-        ESP_LOGI(TAG, "disconnected reason=%d, rescan",
-                 event->disconnect.reason);
-        rhc_conn_handle = BLE_HS_CONN_HANDLE_NONE;
-        rhc_cmd_handle = rhc_state_handle = rhc_cccd_handle = 0;
-        xEventGroupClearBits(rhc_events, RHC_READY_BIT);
+        /* Keep scanning for the other actuator while connected. */
         rhc_start_scan();
         return 0;
-    case BLE_GAP_EVENT_NOTIFY_RX:
-        if (event->notify_rx.attr_handle == rhc_state_handle) {
-            uint16_t len = OS_MBUF_PKTLEN(event->notify_rx.om);
-            if (len >= sizeof(rhc_receipt)) {
-                len = sizeof(rhc_receipt) - 1;
-            }
-            os_mbuf_copydata(event->notify_rx.om, 0, len, rhc_receipt);
-            rhc_receipt[len] = '\0';
-            ESP_LOGI(TAG, "state notify: %s", rhc_receipt);
-            xEventGroupSetBits(rhc_events, RHC_RECEIPT_BIT);
+    }
+    case BLE_GAP_EVENT_DISCONNECT: {
+        rhc_device_t *dev =
+            rhc_find_by_conn(event->disconnect.conn.conn_handle);
+        if (dev == NULL) {
+            return 0;
         }
+        ESP_LOGI(TAG, "disconnected %s reason=%d, rescan",
+                 dev->adv_name, event->disconnect.reason);
+        dev->conn_handle = BLE_HS_CONN_HANDLE_NONE;
+        dev->cmd_handle = dev->state_handle = dev->cccd_handle = 0;
+        dev->ready = false;
+        dev->connecting = false;
+        rhc_start_scan();
         return 0;
+    }
+    case BLE_GAP_EVENT_NOTIFY_RX: {
+        rhc_device_t *dev =
+            rhc_find_by_conn(event->notify_rx.conn_handle);
+        if (dev == NULL ||
+            event->notify_rx.attr_handle != dev->state_handle) {
+            return 0;
+        }
+        uint16_t len = OS_MBUF_PKTLEN(event->notify_rx.om);
+        if (len >= sizeof(dev->receipt)) {
+            len = sizeof(dev->receipt) - 1;
+        }
+        os_mbuf_copydata(event->notify_rx.om, 0, len, dev->receipt);
+        dev->receipt[len] = '\0';
+        ESP_LOGI(TAG, "state notify %s: %s", dev->adv_name, dev->receipt);
+        xEventGroupSetBits(rhc_events, RHC_RECEIPT_BIT);
+        return 0;
+    }
     case BLE_GAP_EVENT_ENC_CHANGE:
         ESP_LOGI(TAG, "encryption change status=%d",
                  event->enc_change.status);
@@ -343,19 +485,20 @@ static int rhc_write_cb(uint16_t conn_handle,
 
 bool ble_central_execute(const char *x_command)
 {
-    /* Parse "device:action[:param]". v1 has one device; anything
-       else is NOT transmitted (a physical action must never be
-       guessed). */
+    /* Parse "device:action[:param]". The device must be one of the
+       two known lights; anything else is NOT transmitted (a
+       physical action must never be guessed). */
     if (x_command == NULL) return false;
     const char *c1 = strchr(x_command, ':');
     if (c1 == NULL || c1 == x_command) return false;
-    char dev[32];
+    char dev_id[32];
     size_t dev_len = (size_t)(c1 - x_command);
-    if (dev_len >= sizeof(dev)) return false;
-    memcpy(dev, x_command, dev_len);
-    dev[dev_len] = '\0';
-    if (strcmp(dev, "livingroom_light") != 0) {
-        ESP_LOGW(TAG, "unknown device '%s', not sent", dev);
+    if (dev_len >= sizeof(dev_id)) return false;
+    memcpy(dev_id, x_command, dev_len);
+    dev_id[dev_len] = '\0';
+    rhc_device_t *dev = rhc_find_by_device_id(dev_id);
+    if (dev == NULL) {
+        ESP_LOGW(TAG, "unknown device '%s', not sent", dev_id);
         return false;
     }
     const char *rest = c1 + 1;
@@ -390,16 +533,15 @@ bool ble_central_execute(const char *x_command)
         return false;
     }
     bool ok = false;
-    if ((xEventGroupGetBits(rhc_events) & RHC_READY_BIT) == 0 ||
-        rhc_conn_handle == BLE_HS_CONN_HANDLE_NONE ||
-        rhc_cmd_handle == 0) {
-        ESP_LOGW(TAG, "actuator not ready, command '%s' dropped",
-                 ble_text);
+    if (!dev->ready || dev->conn_handle == BLE_HS_CONN_HANDLE_NONE ||
+        dev->cmd_handle == 0) {
+        ESP_LOGW(TAG, "%s not ready, command '%s' dropped",
+                 dev->adv_name, ble_text);
         goto done;
     }
     xEventGroupClearBits(rhc_events, RHC_RECEIPT_BIT);
-    rhc_receipt[0] = '\0';
-    int rc = ble_gattc_write_flat(rhc_conn_handle, rhc_cmd_handle,
+    dev->receipt[0] = '\0';
+    int rc = ble_gattc_write_flat(dev->conn_handle, dev->cmd_handle,
                                   ble_text, strlen(ble_text),
                                   rhc_write_cb, NULL);
     if (rc != 0) {
@@ -411,17 +553,17 @@ bool ble_central_execute(const char *x_command)
                                            RHC_RECEIPT_TIMEOUT_MS /
                                                portTICK_PERIOD_MS);
     if ((bits & RHC_RECEIPT_BIT) == 0) {
-        ESP_LOGW(TAG, "receipt timeout %d ms for '%s'",
-                 RHC_RECEIPT_TIMEOUT_MS, ble_text);
+        ESP_LOGW(TAG, "receipt timeout %d ms for '%s' (%s)",
+                 RHC_RECEIPT_TIMEOUT_MS, ble_text, dev->adv_name);
         goto done;
     }
-    if (strcmp(rhc_receipt, expect) == 0) {
-        ESP_LOGI(TAG, "command '%s' confirmed by actuator (%s)",
-                 ble_text, rhc_receipt);
+    if (strcmp(dev->receipt, expect) == 0) {
+        ESP_LOGI(TAG, "command '%s' confirmed by %s (%s)",
+                 ble_text, dev->adv_name, dev->receipt);
         ok = true;
     } else {
-        ESP_LOGW(TAG, "receipt mismatch: got '%s', want '%s'",
-                 rhc_receipt, expect);
+        ESP_LOGW(TAG, "receipt mismatch %s: got '%s', want '%s'",
+                 dev->adv_name, dev->receipt, expect);
     }
 done:
     xSemaphoreGive(rhc_exec_mutex);

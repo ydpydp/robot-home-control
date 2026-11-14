@@ -1,13 +1,26 @@
-/* RHC actuator (N8R8) bench skeleton: BLE peripheral + LED as relay stand-in.
+/* RHC actuator (ESP32-C3 Super Mini) bench skeleton: BLE peripheral + LED
+ * as relay stand-in.
  *
- * Board: ESP32-S3 N8R8. The bench LED stands in for the relay; the relay
- * control is active-low (see below). Boot state is OFF (relay-safe).
- * Relay control pin: GPIO12, ACTIVE-LOW: LOW = ON (closed), HIGH = OFF (open).
- * Boot default is HIGH (OFF, relay-safe). GPIO48 is driven HIGH at boot
- * as a power indicator.
- * GPIO19 is NOT used: it is native USB D-, and N8R8 flashes over native USB,
- * so a load there can break enumeration.
- * Avoided pins: strapping 0/3/45/46, USB 19/20, WS2812 47, UART0 43/44.
+ * Board: ESP32-C3 Super Mini (V1601, chip ESP32-C3FH4, 4 MB flash).
+ * The bench LED stands in for the relay; the relay control is
+ * active-low (see below). Boot state is OFF (relay-safe).
+ * Relay control pin: GPIO10, ACTIVE-LOW: LOW = ON (closed), HIGH = OFF (open).
+ * Boot default is HIGH (OFF, relay-safe). GPIO10 is one of the clean
+ * pins on this board (no strapping, no USB, no LED/button duty).
+ * No power-indicator GPIO: the board already has a power LED, and the
+ * lamp design drives its indicator from 3.3 V through a resistor
+ * (see C3灯控硬件设计单.md), not from a pin.
+ * Flash/monitor over the board's native USB-C (GPIO18/19, no serial
+ * bridge chip): idf.py -p /dev/cu.usbmodem* flash / monitor.
+ * Device identity: RHC_DEVICE_NAME is the broadcast name the central
+ * selects by (RHC-Livingroom / RHC-Bedroom). Set it at build time:
+ *   idf.py -DRHC_DEVICE_NAME=RHC-Livingroom build
+ *   idf.py -DRHC_DEVICE_NAME=RHC-Bedroom build
+ * (default, no -D: RHC-Livingroom). One binary per lamp.
+ * The name is carried in the scan response, not the advertising
+ * packet: flags (3 B) + the 128-bit service UUID (18 B) leave no
+ * room for the 14-byte name in the 31-byte legacy adv packet, and
+ * the central scans actively to read it.
  * Commands are plain text and idempotent; unknown commands are ignored.
  */
 #include <stdio.h>
@@ -30,12 +43,14 @@
 static const char *TAG = "RHC_ACT";
 
 /* Relay control pin (bench LED wired here). Active-low: LOW = ON, HIGH = OFF. */
-#define ACTUATOR_CTRL_GPIO 12
-/* Power indicator: driven HIGH at boot. */
-#define ACTUATOR_PWR_GPIO 48
+#define ACTUATOR_CTRL_GPIO 10
 
-/* BLE identifiers (also in docs/语音控家电v1计划.md §3.2). */
-#define RHC_DEVICE_NAME "RHC-Actuator"
+/* BLE identifiers (also in docs/语音控家电v1计划.md §3.2).
+ * The broadcast name is set at build time (-DRHC_DEVICE_NAME=...);
+ * default is the living-room lamp. */
+#ifndef RHC_DEVICE_NAME
+#define RHC_DEVICE_NAME "RHC-Livingroom"
+#endif
 
 /* 128-bit UUIDs, little-endian byte order (reverse of the string form):
  * service c71566d8-7307-4f3e-a82f-bb0be617b22d
@@ -213,6 +228,19 @@ static void rhc_start_advertising(void)
         ESP_LOGE(TAG, "adv_set_fields failed rc=%d", rc);
         return;
     }
+    /* The broadcast name goes in the scan response: it does not fit
+       in the advertising packet next to the 128-bit service UUID,
+       and the central scans actively to read it. */
+    struct ble_hs_adv_fields rsp_fields;
+    memset(&rsp_fields, 0, sizeof(rsp_fields));
+    rsp_fields.name = (uint8_t *)RHC_DEVICE_NAME;
+    rsp_fields.name_len = strlen(RHC_DEVICE_NAME);
+    rsp_fields.name_is_complete = 1;
+    rc = ble_gap_adv_rsp_set_fields(&rsp_fields);
+    if (rc != 0) {
+        ESP_LOGE(TAG, "adv_rsp_set_fields failed rc=%d", rc);
+        return;
+    }
     rc = ble_hs_id_infer_auto(0, &own_addr_type);
     if (rc != 0) {
         ESP_LOGE(TAG, "id_infer_auto failed rc=%d", rc);
@@ -267,14 +295,10 @@ void app_main(void)
     }
     ESP_ERROR_CHECK(ret);
 
-    /* Relay control (bench LED wired here): boot HIGH = OFF (relay-safe).
-     * Power indicator: boot HIGH. */
+    /* Relay control (bench LED wired here): boot HIGH = OFF (relay-safe). */
     gpio_reset_pin(ACTUATOR_CTRL_GPIO);
     gpio_set_direction(ACTUATOR_CTRL_GPIO, GPIO_MODE_OUTPUT);
     gpio_set_level(ACTUATOR_CTRL_GPIO, 1);
-    gpio_reset_pin(ACTUATOR_PWR_GPIO);
-    gpio_set_direction(ACTUATOR_PWR_GPIO, GPIO_MODE_OUTPUT);
-    gpio_set_level(ACTUATOR_PWR_GPIO, 1);
     rhc_state_on = 0;
 
     /* Watchdog, fed by the main loop below. IDF already initializes the
