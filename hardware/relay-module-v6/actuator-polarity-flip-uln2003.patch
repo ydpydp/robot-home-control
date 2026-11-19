@@ -1,0 +1,64 @@
+--- a/actuator/main/main.c	2026-11-19 09:32:29.430612007 +0000
++++ b/actuator/main/main.c	2026-11-19 09:32:42.798612005 +0000
+@@ -3,9 +3,13 @@
+  *
+  * Board: ESP32-C3 Super Mini (V1601, chip ESP32-C3FH4, 4 MB flash).
+  * The bench LED stands in for the relay; the relay control is
+- * active-low (see below). Boot state is OFF (relay-safe).
+- * Relay control pin: GPIO10, ACTIVE-LOW: LOW = ON (closed), HIGH = OFF (open).
+- * Boot default is HIGH (OFF, relay-safe). GPIO10 is one of the clean
++ * active-low on the bench (direct drive, no driver chip). On the v6
++ * relay module board the relay is driven through a ULN2003, which
++ * inverts: GPIO10 HIGH = relay ON. This patch is for the v6 board only;
++ * the bench LED-only build keeps the old active-low polarity.
++ * Relay control pin: GPIO10, ACTIVE-HIGH through ULN2003: HIGH = ON
++ * (closed), LOW = OFF (open). Boot default is LOW (OFF, relay-safe).
++ * GPIO10 is one of the clean
+  * pins on this board (no strapping, no USB, no LED/button duty).
+  * No power-indicator GPIO: the board already has a power LED, and the
+  * lamp design drives its indicator from 3.3 V through a resistor
+@@ -42,7 +46,7 @@
+ 
+ static const char *TAG = "RHC_ACT";
+ 
+-/* Relay control pin (bench LED wired here). Active-low: LOW = ON, HIGH = OFF. */
++/* Relay control pin. Active-high through ULN2003 on the v6 relay module board: HIGH = ON, LOW = OFF. */
+ #define ACTUATOR_CTRL_GPIO 10
+ 
+ /* Bench-test indicator: the Super Mini's onboard blue LED is on
+@@ -85,7 +89,10 @@
+ static void rhc_apply_state(int on)
+ {
+     rhc_state_on = on ? 1 : 0;
+-    gpio_set_level(ACTUATOR_CTRL_GPIO, rhc_state_on ? 0 : 1);
++    gpio_set_level(ACTUATOR_CTRL_GPIO, rhc_state_on ? 1 : 0);
++    /* Onboard blue LED is wired 3.3V -> 1K -> LED -> GPIO8, so it lights
++     * when the pin is LOW: keep it inverted relative to the relay pin,
++     * so LED lit still means relay ON. */
+     gpio_set_level(ACTUATOR_LED_GPIO, rhc_state_on ? 0 : 1);
+     ESP_LOGI(TAG, "state -> %s", rhc_state_on ? "ON" : "OFF");
+ }
+@@ -126,7 +133,7 @@
+     } else if (strcmp(buf, "OFF") == 0) {
+         rhc_apply_state(0);
+     } else if (strncmp(buf, "BRI:", 4) == 0) {
+-        /* No brightness on a relay: any level > 0 means ON (pin low). */
++        /* No brightness on a relay: any level > 0 means ON (pin high through ULN2003). */
+         rhc_apply_state(atoi(buf + 4) > 0);
+     } else {
+         ESP_LOGW(TAG, "unknown command, ignored");
+@@ -307,11 +314,12 @@
+     }
+     ESP_ERROR_CHECK(ret);
+ 
+-    /* Relay control (bench LED wired here): boot HIGH = OFF (relay-safe).
++    /* Relay control via ULN2003 on the v6 relay module board:
++     * boot LOW = OFF (relay-safe). HIGH at boot would energise the relay.
+      * Onboard blue LED mirrors the relay: boot HIGH = LED off. */
+     gpio_reset_pin(ACTUATOR_CTRL_GPIO);
+     gpio_set_direction(ACTUATOR_CTRL_GPIO, GPIO_MODE_OUTPUT);
+-    gpio_set_level(ACTUATOR_CTRL_GPIO, 1);
++    gpio_set_level(ACTUATOR_CTRL_GPIO, 0);
+     gpio_reset_pin(ACTUATOR_LED_GPIO);
+     gpio_set_direction(ACTUATOR_LED_GPIO, GPIO_MODE_OUTPUT);
+     gpio_set_level(ACTUATOR_LED_GPIO, 1);

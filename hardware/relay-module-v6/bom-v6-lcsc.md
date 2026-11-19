@@ -27,10 +27,21 @@ BOM 底本：`bom-v6.csv`（10 行、14 个焊装位置）。
 这两款详情页也显示 "SMT Extended" 标签，但封装字段明确是 Through Hole / TO-220，
 属于插装件，不能仅凭该标签认定可贴片。不要把它们填进 SMT 的 BOM/CPL，作手焊件处理。
 
-## 未核查（同样是通孔件，不进 SMT）
+## 已核查（通孔件，不进 SMT）
 
-- J1、J2：2.54mm 1x08 排针/排母，通孔。
-- J3、J4、J5、J7、J8：3.5mm 弯针拔插端子，通孔。
+| 位号 | 规格 | LCSC 编号 | 制造商型号 | 库存（核查时） | 单价（核查时） | 备注 |
+|---|---|---|---|---|---|---|
+| J1, J2 | 2.54mm 排母 1x08，直插 | C27438 | BOOMELE 2.54-1*8P | 有货 | $0.0626 | Female Header 8 Position 2.54mm Pitch Single Row Through Hole；8.5mm 高、3A。核查时间 2026-11-19。https://www.lcsc.com/product-detail/C27438.html |
+| J3, J5, J7, J8 | 3.5mm 弯针拔插端子针座 2P | C49118102 | HanElectricity 2EDGR-3.5-2P | 420 | $0.0274（10+，起订 10） | 间距 3.50mm、针宽 0.80mm、开孔 Ø1.40mm，与板上封装匹配。核查时间 2026-11-19。https://www.lcsc.com/product-detail/C49118102.html |
+| J4 | 3.5mm 弯针拔插端子针座 3P | C49118103 | HanElectricity 2EDGR-3.5-3P | 485 | $0.0445（5+，起订 5） | 同上。核查时间 2026-11-19。https://www.lcsc.com/product-detail/C49118103.html |
+| （配对插头） | 3.5mm 拔插端子插头 2P | C49118108 | HanElectricity 2EDGK-3.5-2P | 435 | $0.1340（5+，起订 5） | 与 C49118102 配对，线头侧带螺丝压线。核查时间 2026-11-19。https://www.lcsc.com/product-detail/C49118108.html |
+| （配对插头） | 3.5mm 拔插端子插头 3P | C49118109 | HanElectricity 2EDGK-3.5-3P | 295 | $0.1106（5+，起订 5） | 与 C49118103 配对。核查时间 2026-11-19。https://www.lcsc.com/product-detail/C49118109.html |
+
+端子注意（2026-11-19 核查时）：
+- 2EDG-3.5 是 HanElectricity 的 Phoenix 兼容系列，不是 Phoenix 原厂；Phoenix 关键词在立创搜不到原装。
+- 针座本体深 9.20mm，比 Phoenix 的 7.6mm 深，焊前先干装核对与邻件间隙。
+- 针座与插头按同厂同系列同间距配对，但数据手册（1 页机械图）没有明确“mates with”表述，先焊一套确认插头插拔顺滑再焊其余。
+- 别买错：DEGSON 15EDGK-3.5（C5632692/C7603431）只有插头半边、立创无对应针座；C7168402 是 5mm 间距不是 3.5mm。
 
 ## 本地操作（kicad-jlcpcb-tools）
 
